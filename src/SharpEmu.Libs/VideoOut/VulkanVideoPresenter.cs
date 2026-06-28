@@ -23,7 +23,61 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly object _gate = new();
     private static Thread? _thread;
     private static Presentation? _latestPresentation;
+    private static uint _windowWidth;
+    private static uint _windowHeight;
     private static bool _closed;
+
+    public static void EnsureStarted(uint width, uint height)
+    {
+        if (width == 0 || height == 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_closed || _thread is not null)
+            {
+                return;
+            }
+        }
+
+        var hasSplash = PngSplashLoader.TryLoad(
+            out var splashPixels,
+            out var splashWidth,
+            out var splashHeight);
+        lock (_gate)
+        {
+            if (_closed || _thread is not null)
+            {
+                return;
+            }
+
+            _windowWidth = width;
+            _windowHeight = height;
+            _latestPresentation ??= hasSplash
+                ? new Presentation(
+                    splashPixels,
+                    splashWidth,
+                    splashHeight,
+                    1,
+                    GuestDrawKind.None,
+                    IsSplash: true)
+                : new Presentation(
+                    null,
+                    width,
+                    height,
+                    0,
+                    GuestDrawKind.None,
+                    IsSplash: false);
+            _thread = new Thread(Run)
+            {
+                IsBackground = true,
+                Name = "SharpEmu Vulkan VideoOut",
+            };
+            _thread.Start();
+        }
+    }
 
     public static void Submit(byte[] bgraFrame, uint width, uint height)
     {
@@ -40,12 +94,20 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
-            _latestPresentation = new Presentation(bgraFrame, width, height, sequence, GuestDrawKind.None);
+            _latestPresentation = new Presentation(
+                bgraFrame,
+                width,
+                height,
+                sequence,
+                GuestDrawKind.None,
+                IsSplash: false);
             if (_thread is not null)
             {
                 return;
             }
 
+            _windowWidth = width;
+            _windowHeight = height;
             _thread = new Thread(Run)
             {
                 IsBackground = true,
@@ -74,12 +136,20 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
-            _latestPresentation = new Presentation(null, width, height, sequence, drawKind);
+            _latestPresentation = new Presentation(
+                null,
+                width,
+                height,
+                sequence,
+                drawKind,
+                IsSplash: false);
             if (_thread is not null)
             {
                 return;
             }
 
+            _windowWidth = width;
+            _windowHeight = height;
             _thread = new Thread(Run)
             {
                 IsBackground = true,
@@ -95,8 +165,8 @@ internal static unsafe class VulkanVideoPresenter
         uint height;
         lock (_gate)
         {
-            width = _latestPresentation?.Width ?? 1280;
-            height = _latestPresentation?.Height ?? 720;
+            width = _windowWidth == 0 ? _latestPresentation?.Width ?? 1280 : _windowWidth;
+            height = _windowHeight == 0 ? _latestPresentation?.Height ?? 720 : _windowHeight;
         }
 
         try
@@ -138,7 +208,8 @@ internal static unsafe class VulkanVideoPresenter
         uint Width,
         uint Height,
         long Sequence,
-        GuestDrawKind DrawKind);
+        GuestDrawKind DrawKind,
+        bool IsSplash);
 
     private sealed class Presenter : IDisposable
     {
@@ -179,6 +250,7 @@ internal static unsafe class VulkanVideoPresenter
         private bool _vulkanReady;
         private bool _firstFramePresented;
         private bool _firstGuestDrawPresented;
+        private bool _splashPresented;
 
         public Presenter(uint width, uint height)
         {
@@ -813,7 +885,14 @@ internal static unsafe class VulkanVideoPresenter
             Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle");
             _imageInitialized[imageIndex] = true;
             _presentedSequence = presentation.Sequence;
-            if (!_firstFramePresented)
+            if (presentation.IsSplash && !_splashPresented)
+            {
+                _splashPresented = true;
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] Vulkan VideoOut presented splash: " +
+                    $"{presentation.Width}x{presentation.Height}");
+            }
+            else if (!presentation.IsSplash && !_firstFramePresented)
             {
                 _firstFramePresented = true;
                 Console.Error.WriteLine(

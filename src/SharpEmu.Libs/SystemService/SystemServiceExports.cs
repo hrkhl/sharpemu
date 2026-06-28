@@ -13,6 +13,34 @@ public static class SystemServiceExports
     private const int DisplaySafeAreaInfoSize = sizeof(float) + 128;
 
     [SysAbiExport(
+        Nid = "fZo48un7LK4",
+        ExportName = "sceSystemServiceParamGetInt",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceParamGetInt(CpuContext ctx)
+    {
+        var parameterId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var valueAddress = ctx[CpuRegister.Rsi];
+        if (valueAddress == 0)
+        {
+            return SetReturn(ctx, OrbisSystemServiceErrorParameter);
+        }
+
+        var value = parameterId switch
+        {
+            1 or 2 or 3 or 1000 => 1,
+            4 => 180,
+            _ => 0,
+        };
+
+        Span<byte> valueBytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(valueBytes, value);
+        return ctx.Memory.TryWrite(valueAddress, valueBytes)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
         Nid = "rPo6tV8D9bM",
         ExportName = "sceSystemServiceGetStatus",
         Target = Generation.Gen4 | Generation.Gen5,

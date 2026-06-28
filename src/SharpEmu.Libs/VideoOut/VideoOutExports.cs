@@ -29,8 +29,11 @@ public static class VideoOutExports
     private const int VideoOutBufferAttributeSize = 0x28;
     private const int VideoOutBufferAttribute2Size = 0x50;
     private const int VideoOutBuffersEntrySize = 0x20;
+    private const int VideoOutOutputStatusSize = 0x30;
     private const ulong SceVideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong SceVideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
+    private const ulong SceVideoOutPixelFormatB8G8R8A8Unorm = 0x8100000000000000;
+    private const ulong SceVideoOutPixelFormatR8G8B8A8Unorm = 0x8100000022000000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10 = 0x88060000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Srgb = 0x88000000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Bt2020Pq = 0x88740000;
@@ -82,6 +85,10 @@ public static class VideoOutExports
         public ulong VblankCount { get; set; }
         public ulong FlipCount { get; set; }
         public int CurrentBuffer { get; set; } = -1;
+        public uint OutputWidth { get; set; } = 1920;
+        public uint OutputHeight { get; set; } = 1080;
+        public uint RefreshRate { get; set; } = 60;
+        public float Gamma { get; set; } = 1.0f;
         public VideoOutBufferGroup?[] Groups { get; } = new VideoOutBufferGroup?[MaxDisplayBufferGroups];
         public VideoOutBufferSlot[] BufferSlots { get; } = CreateBufferSlots();
         public List<FlipEventRegistration> FlipEvents { get; } = new();
@@ -193,6 +200,93 @@ public static class VideoOutExports
         }
 
         port.FlipRate = rate;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "utPrVdxio-8",
+        ExportName = "sceVideoOutGetOutputStatus",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetOutputStatus(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var statusAddress = ctx[CpuRegister.Rsi];
+        if (statusAddress == 0)
+        {
+            return OrbisVideoOutErrorInvalidAddress;
+        }
+
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        Span<byte> status = stackalloc byte[VideoOutOutputStatusSize];
+        status.Clear();
+        var resolutionClass = port.OutputWidth >= 3840 || port.OutputHeight >= 2160 ? 2 : 1;
+        BinaryPrimitives.WriteInt32LittleEndian(status[0x00..0x04], resolutionClass);
+        BinaryPrimitives.WriteInt32LittleEndian(status[0x04..0x08], 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..0x10], port.RefreshRate);
+        return ctx.Memory.TryWrite(statusAddress, status)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+    }
+
+    [SysAbiExport(
+        Nid = "DYhhWbJSeRg",
+        ExportName = "sceVideoOutColorSettingsSetGamma_",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutColorSettingsSetGamma(CpuContext ctx)
+    {
+        var settingsAddress = ctx[CpuRegister.Rdi];
+        if (settingsAddress == 0)
+        {
+            return OrbisVideoOutErrorInvalidAddress;
+        }
+
+        ctx.GetXmmRegister(0, out var xmm0Low, out _);
+        var gamma = BitConverter.Int32BitsToSingle(unchecked((int)xmm0Low));
+        if (!float.IsFinite(gamma) || gamma is < 0.1f or > 2.0f)
+        {
+            return OrbisVideoOutErrorInvalidValue;
+        }
+
+        Span<byte> gammaBytes = stackalloc byte[sizeof(float)];
+        BinaryPrimitives.WriteInt32LittleEndian(gammaBytes, BitConverter.SingleToInt32Bits(gamma));
+        return ctx.Memory.TryWrite(settingsAddress, gammaBytes)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+    }
+
+    [SysAbiExport(
+        Nid = "pv9CI5VC+R0",
+        ExportName = "sceVideoOutAdjustColor_",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutAdjustColor(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var settingsAddress = ctx[CpuRegister.Rsi];
+        if (settingsAddress == 0)
+        {
+            return OrbisVideoOutErrorInvalidAddress;
+        }
+
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        Span<byte> gammaBytes = stackalloc byte[sizeof(float)];
+        if (!ctx.Memory.TryRead(settingsAddress, gammaBytes))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        port.Gamma = BitConverter.Int32BitsToSingle(
+            BinaryPrimitives.ReadInt32LittleEndian(gammaBytes));
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -715,6 +809,8 @@ public static class VideoOutExports
                 Index = groupIndex,
                 Attribute = attribute,
             };
+            port.OutputWidth = attribute.Width;
+            port.OutputHeight = attribute.Height;
 
             for (var i = 0; i < addresses.Length; i++)
             {
@@ -726,6 +822,7 @@ public static class VideoOutExports
 
             TraceVideoOut(
                 $"videoout.register_buffers handle={port.Handle} group={groupIndex} start={startIndex} count={addresses.Length} fmt=0x{attribute.PixelFormat:X} tile={attribute.TilingMode} {attribute.Width}x{attribute.Height} pitch={attribute.PitchInPixel}");
+            VulkanVideoPresenter.EnsureStarted(attribute.Width, attribute.Height);
             return groupIndex;
         }
     }
@@ -939,6 +1036,8 @@ public static class VideoOutExports
     private static uint GetBytesPerPixel(ulong pixelFormat) =>
         pixelFormat is SceVideoOutPixelFormatA8R8G8B8Srgb or
             SceVideoOutPixelFormatA8B8G8R8Srgb or
+            SceVideoOutPixelFormatB8G8R8A8Unorm or
+            SceVideoOutPixelFormatR8G8B8A8Unorm or
             SceVideoOutPixelFormatA2R10G10B10 or
             SceVideoOutPixelFormatA2R10G10B10Srgb or
             SceVideoOutPixelFormatA2R10G10B10Bt2020Pq
@@ -973,7 +1072,7 @@ public static class VideoOutExports
         var dst = 0;
         for (var src = 0; src + 3 < source.Length; src += 4)
         {
-            if (pixelFormat == SceVideoOutPixelFormatA8B8G8R8Srgb)
+            if (pixelFormat is SceVideoOutPixelFormatA8B8G8R8Srgb or SceVideoOutPixelFormatR8G8B8A8Unorm)
             {
                 destination[dst++] = source[src + 0];
                 destination[dst++] = source[src + 1];
